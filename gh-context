@@ -1,0 +1,365 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# gh-context: A kubectx-style context switcher for GitHub CLI
+# Manages multiple GitHub accounts/hosts and switches between them easily
+
+# Config locations (XDG Base Directory compliant)
+CTX_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gh/contexts"
+ACTIVE_FILE="$CTX_DIR/active"
+mkdir -p "$CTX_DIR"
+
+usage() {
+  cat <<'EOF'
+gh-context: A kubectx-style context switcher for GitHub CLI
+
+Usage:
+  gh context list
+  gh context current
+  gh context new [--from-current | --hostname <host> --user <user>] [--transport ssh|https] [--ssh-host <alias>] --name <name>
+  gh context use <name>
+  gh context delete <name>
+  gh context bind <name>
+  gh context unbind
+  gh context apply
+  gh context shell-hook
+
+Commands:
+  list                    List all contexts with active indicator
+  current                 Show active context and repo-bound context
+  new                     Create a new context
+  use <name>              Switch to context (calls gh auth switch + setup-git + refresh)
+  delete <name>           Remove a saved context
+  bind <name>             Write .ghcontext in repo root
+  unbind                  Remove .ghcontext from repo root
+  apply                   Read .ghcontext in this repo and switch to it
+  shell-hook              Print shell snippet for auto-apply on cd
+
+Examples:
+  gh context new --from-current --name work
+  gh context new --hostname github.com --user myuser --transport ssh --name personal
+  gh context use work
+  gh context bind work
+  gh context shell-hook >> ~/.bashrc
+
+Contexts are stored in: $CTX_DIR
+EOF
+}
+
+err() { echo "✗ $*" >&2; }
+info() { echo "• $*"; }
+ok() { echo "✓ $*"; }
+
+ctx_file() { echo "$CTX_DIR/$1.ctx"; }
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+repo_root() {
+  git rev-parse --show-toplevel 2>/dev/null || true
+}
+
+read_kv() {
+  # shellcheck disable=SC1090
+  source "$1"
+}
+
+write_ctx() {
+  local file="$1" hostname="$2" user="$3" transport="$4" ssh_host="${5:-}"
+  {
+    echo "HOSTNAME=$hostname"
+    echo "USER=$user"
+    echo "TRANSPORT=$transport"
+    echo "SSH_HOST_ALIAS=$ssh_host"
+  } > "$file"
+}
+
+get_active_name() {
+  [[ -f "$ACTIVE_FILE" ]] && cat "$ACTIVE_FILE" || true
+}
+
+set_active_name() {
+  echo "$1" > "$ACTIVE_FILE"
+}
+
+ensure_logged_in() {
+  local host="$1" user="$2"
+  if ! GH_HOST="$host" gh auth token --hostname "$host" >/dev/null 2>&1; then
+    err "No authentication found for '$host'"
+    info "To fix this, run: gh auth login --hostname $host --scopes repo,read:org"
+    exit 1
+  fi
+  
+  # Verify the token is for the expected user
+  local current_user
+  if current_user="$(GH_HOST="$host" gh api user --hostname "$host" --jq .login 2>/dev/null)"; then
+    # Handle case where jq output might include quotes or other formatting
+    current_user="${current_user//\"/}"  # Remove quotes
+    current_user="${current_user// /}"   # Remove spaces
+    if [[ "$current_user" != "$user" ]]; then
+      err "Authenticated as '$current_user' on '$host', but context expects '$user'"
+      info "To fix this, run: gh auth login --hostname $host --username $user --scopes repo,read:org"
+      exit 1
+    fi
+  else
+    err "Unable to verify authentication for '$user' on '$host'"
+    info "Your token may be expired. Run: gh auth refresh --hostname $host"
+    exit 1
+  fi
+}
+
+validate_context_name() {
+  local name="$1"
+  if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    err "Context name '$name' contains invalid characters"
+    info "Use only alphanumeric characters, hyphens, and underscores"
+    exit 1
+  fi
+}
+
+# Subcommands
+cmd_list() {
+  local active
+  active="$(get_active_name)"
+  
+  if ! ls "$CTX_DIR"/*.ctx >/dev/null 2>&1; then
+    info "No contexts found. Create one with: gh context new --from-current --name <name>"
+    return 0
+  fi
+  
+  printf "Available contexts:\n"
+  for f in "$CTX_DIR"/*.ctx; do
+    local name
+    name="$(basename "$f" .ctx)"
+    read_kv "$f"
+    local indicator=""
+    [[ "$name" == "$active" ]] && indicator=" *"
+    printf "  %s%s\t(%s@%s, %s%s)\n" \
+      "$name" "$indicator" "$USER" "$HOSTNAME" "$TRANSPORT" \
+      "$( [[ -n "${SSH_HOST_ALIAS:-}" ]] && printf ", ssh_host=%s" "$SSH_HOST_ALIAS" )"
+  done
+  
+  [[ -n "$active" ]] && printf "\n* = active context\n"
+}
+
+cmd_current() {
+  local active
+  active="$(get_active_name)"
+  
+  if [[ -z "$active" ]]; then
+    echo "No active context"
+  else
+    local f; f="$(ctx_file "$active")"
+    if [[ -f "$f" ]]; then
+      read_kv "$f"
+      echo "Active: $active ($USER@$HOSTNAME, $TRANSPORT${SSH_HOST_ALIAS:+, ssh_host=$SSH_HOST_ALIAS})"
+    else
+      err "Active context '$active' points to missing file"
+      info "Run 'gh context list' to see available contexts"
+    fi
+  fi
+
+  local root; root="$(repo_root)"
+  if [[ -n "$root" && -f "$root/.ghcontext" ]]; then
+    local bound; bound="$(cat "$root/.ghcontext")"
+    echo "Repo-bound: $bound (in $root/.ghcontext)"
+  fi
+}
+
+cmd_new() {
+  local name="" from_current="false" host="" user="" transport="ssh" ssh_host=""
+  
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) name="$2"; shift 2;;
+      --from-current) from_current="true"; shift;;
+      --hostname) host="$2"; shift 2;;
+      --user) user="$2"; shift 2;;
+      --transport) transport="$2"; shift 2;;
+      --ssh-host) ssh_host="$2"; shift 2;;
+      *) err "Unknown flag: $1"; usage; exit 1;;
+    esac
+  done
+  
+  [[ -n "$name" ]] || { err "Context name is required (--name <name>)"; exit 1; }
+  validate_context_name "$name"
+  
+  local file; file="$(ctx_file "$name")"
+  [[ -f "$file" ]] && { err "Context '$name' already exists"; exit 1; }
+
+  if [[ "$from_current" == "true" ]]; then
+    host="${host:-${GH_HOST:-github.com}}"
+    
+    if ! login="$(GH_HOST="$host" gh api user --hostname "$host" --jq .login 2>/dev/null)"; then
+      err "Could not detect current user on '$host'"
+      info "Make sure you're logged in: gh auth login --hostname $host"
+      exit 1
+    fi
+    user="${user:-$login}"
+  else
+    if [[ -z "$host" || -z "$user" ]]; then
+      err "Provide either --from-current or both --hostname and --user"
+      usage
+      exit 1
+    fi
+  fi
+
+  # Validate transport
+  case "$transport" in
+    ssh|https) ;;
+    *) err "Transport must be 'ssh' or 'https', got: $transport"; exit 1;;
+  esac
+
+  write_ctx "$file" "$host" "$user" "$transport" "$ssh_host"
+  ok "Created context '$name' → $user@$host ($transport${ssh_host:+, ssh_host=$ssh_host})"
+}
+
+cmd_use() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || { err "Context name required"; info "Usage: gh context use <name>"; exit 1; }
+  
+  local file; file="$(ctx_file "$name")"
+  [[ -f "$file" ]] || { 
+    err "Context '$name' not found"
+    info "Available contexts: $(ls "$CTX_DIR"/*.ctx 2>/dev/null | xargs -I {} basename {} .ctx | tr '\n' ' ' || echo 'none')"
+    exit 1
+  }
+  
+  read_kv "$file"
+  ensure_logged_in "$HOSTNAME" "$USER"
+
+  info "Switching to $USER@$HOSTNAME..."
+  
+  # Switch authentication
+  if ! GH_HOST="$HOSTNAME" gh auth switch --hostname "$HOSTNAME" --user "$USER" 2>/dev/null; then
+    err "Failed to switch authentication"
+    info "Try: gh auth login --hostname $HOSTNAME --username $USER"
+    exit 1
+  fi
+
+  # Setup Git integration
+  if ! GH_HOST="$HOSTNAME" gh auth setup-git --hostname "$HOSTNAME" 2>/dev/null; then
+    info "Warning: Failed to setup Git integration (continuing anyway)"
+  fi
+
+  # Refresh token (best effort)
+  GH_HOST="$HOSTNAME" gh auth refresh --hostname "$HOSTNAME" >/dev/null 2>&1 || true
+
+  set_active_name "$name"
+  ok "Now using context '$name'"
+}
+
+cmd_delete() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || { err "Context name required"; info "Usage: gh context delete <name>"; exit 1; }
+  
+  local file; file="$(ctx_file "$name")"
+  [[ -f "$file" ]] || { err "Context '$name' not found"; exit 1; }
+  
+  rm -f "$file"
+  
+  # Clear active pointer if it pointed to this context
+  if [[ "$(get_active_name)" == "$name" ]]; then
+    rm -f "$ACTIVE_FILE"
+    info "Cleared active context pointer"
+  fi
+  
+  ok "Deleted context '$name'"
+}
+
+cmd_bind() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || { err "Context name required"; info "Usage: gh context bind <name>"; exit 1; }
+  
+  local file; file="$(ctx_file "$name")"
+  [[ -f "$file" ]] || { err "Context '$name' not found"; exit 1; }
+
+  local root; root="$(repo_root)"
+  [[ -n "$root" ]] || { err "Not inside a Git repository"; exit 1; }
+  
+  echo "$name" > "$root/.ghcontext"
+  ok "Bound repo to context '$name' ($root/.ghcontext)"
+  info "Add .ghcontext to .gitignore if you don't want to commit it"
+}
+
+cmd_unbind() {
+  local root; root="$(repo_root)"
+  [[ -n "$root" ]] || { err "Not inside a Git repository"; exit 1; }
+  
+  if [[ -f "$root/.ghcontext" ]]; then
+    rm -f "$root/.ghcontext"
+    ok "Removed repo binding"
+  else
+    info "No repo binding found"
+  fi
+}
+
+cmd_apply() {
+  local root; root="$(repo_root)"
+  [[ -n "$root" ]] || { err "Not inside a Git repository"; exit 1; }
+  [[ -f "$root/.ghcontext" ]] || { 
+    err "No .ghcontext file found in repository"
+    info "Create one with: gh context bind <name>"
+    exit 1
+  }
+  
+  local name; name="$(cat "$root/.ghcontext")"
+  cmd_use "$name"
+}
+
+cmd_shell_hook() {
+  cat <<'EOS'
+# Auto-apply gh context when entering a repo with .ghcontext
+# Add this to your shell configuration (.bashrc, .zshrc, etc.)
+
+gh_context_auto_apply() {
+  local root
+  root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+  
+  if [[ -f "$root/.ghcontext" ]]; then
+    local name current
+    name="$(cat "$root/.ghcontext")"
+    current=""
+    [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/gh/contexts/active" ]] && \
+      current="$(cat "${XDG_CONFIG_HOME:-$HOME/.config}/gh/contexts/active")"
+    
+    if [[ "$current" != "$name" ]]; then
+      echo "• Auto-applying gh context: $name"
+      gh context use "$name" 2>/dev/null || true
+    fi
+  fi
+}
+
+# Bash integration
+if [[ -n "${BASH_VERSION:-}" ]]; then
+  PROMPT_COMMAND="gh_context_auto_apply; ${PROMPT_COMMAND:-}"
+fi
+
+# Zsh integration  
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+  autoload -U add-zsh-hook
+  add-zsh-hook precmd gh_context_auto_apply
+fi
+EOS
+}
+
+# Main dispatch
+if ! have_cmd gh; then
+  err "GitHub CLI (gh) not found"
+  info "Install it from: https://cli.github.com/"
+  exit 1
+fi
+
+sub="${1:-}"
+case "$sub" in
+  list) shift; cmd_list "$@";;
+  current) shift; cmd_current "$@";;
+  new) shift; cmd_new "$@";;
+  use) shift; cmd_use "$@";;
+  delete) shift; cmd_delete "$@";;
+  bind) shift; cmd_bind "$@";;
+  unbind) shift; cmd_unbind "$@";;
+  apply) shift; cmd_apply "$@";;
+  shell-hook) shift; cmd_shell_hook "$@";;
+  -h|--help|help|"") usage;;
+  *) err "Unknown command: $sub"; echo; usage; exit 1;;
+esac

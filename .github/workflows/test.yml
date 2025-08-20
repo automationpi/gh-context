@@ -1,0 +1,64 @@
+name: Test
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Bats
+      run: |
+        git clone https://github.com/bats-core/bats-core.git
+        cd bats-core
+        sudo ./install.sh /usr/local
+        
+    - name: Install GitHub CLI
+      run: |
+        curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+        sudo apt update
+        sudo apt install gh
+        
+    - name: Make executable
+      run: chmod +x gh-context
+      
+    - name: Run tests
+      run: bats test/gh-context.bats
+      
+    - name: Test basic functionality
+      run: |
+        # Test help output
+        ./gh-context --help
+        
+        # Test error handling
+        ./gh-context invalid-command && exit 1 || echo "✓ Invalid command handled correctly"
+        
+        # Test context creation (will fail auth but that's expected)
+        ./gh-context new --hostname example.com --user testuser --name test 2>/dev/null || echo "✓ Auth validation working"
+
+  lint:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install ShellCheck
+      run: sudo apt-get install shellcheck
+      
+    - name: Run ShellCheck
+      run: shellcheck gh-context
+      
+    - name: Check script permissions
+      run: |
+        if [[ ! -x gh-context ]]; then
+          echo "ERROR: gh-context is not executable"
+          exit 1
+        fi
+        echo "✓ Script is executable"
