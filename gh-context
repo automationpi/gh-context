@@ -244,19 +244,24 @@ cmd_use() {
 test_auth() {
   local host="$1" user="$2"
   
-  # Quick token check
-  if ! GH_HOST="$host" gh auth token --hostname "$host" >/dev/null 2>&1; then
-    return 1
+  # Check if the target user has authentication available
+  if ! gh auth status --hostname "$host" 2>/dev/null | grep -q "Logged in to $host account $user"; then
+    return 1  # User not authenticated at all
   fi
   
-  # Check if it's the right user (with timeout)
-  local current_user
-  if current_user="$(timeout 3 bash -c "GH_HOST=\"$host\" gh api user --hostname \"$host\" --jq .login 2>/dev/null")"; then
-    current_user="${current_user//\"/}"
-    current_user="${current_user// /}"
-    [[ "$current_user" == "$user" ]]
+  # Try to switch to the user (this is fast if they're already authenticated)
+  if GH_HOST="$host" gh auth switch --hostname "$host" --user "$user" >/dev/null 2>&1; then
+    # Verify the switch worked with a quick API test
+    local current_user
+    if current_user="$(timeout 3 bash -c "GH_HOST=\"$host\" gh api user --hostname \"$host\" --jq .login 2>/dev/null")"; then
+      current_user="${current_user//\"/}"
+      current_user="${current_user// /}"
+      [[ "$current_user" == "$user" ]]
+    else
+      return 1
+    fi
   else
-    return 1
+    return 1  # Switch failed
   fi
 }
 
