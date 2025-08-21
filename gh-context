@@ -383,30 +383,18 @@ cmd_auth_status() {
     printf "  User: %s\n" "$USER"
     printf "  Transport: %s\n" "$TRANSPORT"
     
-    # Check authentication status
+    # Check authentication status without switching users
     local auth_status="❌"
-    local current_user=""
     
-    if GH_HOST="$HOSTNAME" gh auth token --hostname "$HOSTNAME" >/dev/null 2>&1; then
-      if current_user="$(GH_HOST="$HOSTNAME" gh api user --hostname "$HOSTNAME" --jq .login 2>/dev/null)"; then
-        current_user="${current_user//\"/}"
-        current_user="${current_user// /}"
-        if [[ "$current_user" == "$USER" ]]; then
-          auth_status="✅"
-        else
-          auth_status="⚠️  (authenticated as $current_user)"
-        fi
-      else
-        auth_status="⚠️  (token may be expired)"
-      fi
+    # Check if user has stored credentials
+    if gh auth status --hostname "$HOSTNAME" 2>/dev/null | grep -q "Logged in to $HOSTNAME account $USER"; then
+      auth_status="✅"
     fi
     
     printf "  Auth: %s\n" "$auth_status"
     
-    # Show login command if not authenticated correctly
+    # Show login command if not authenticated
     if [[ "$auth_status" == "❌" ]]; then
-      printf "  To fix: gh auth login --hostname %s --username %s --scopes repo,read:org\n" "$HOSTNAME" "$USER"
-    elif [[ "$auth_status" == ⚠️* ]]; then
       printf "  To fix: gh auth login --hostname %s --username %s --scopes repo,read:org\n" "$HOSTNAME" "$USER"
     fi
     
