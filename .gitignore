@@ -102,4 +102,7 @@ config.local
 test/.env
 test/config.local
 
+# gh-context repo bindings (optional - you may want to commit these)
+.ghcontext
+
 

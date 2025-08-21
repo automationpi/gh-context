@@ -14,7 +14,6 @@ A `kubectx`-style context switcher for GitHub CLI.
 ```bash
 gh extension install automationpi/gh-context
 ```
-
 Or manually:
 ```bash
 git clone https://github.com/automationpi/gh-context.git
@@ -59,6 +58,7 @@ gh context shell-hook >> ~/.bashrc
 | `gh context unbind` | Remove repo binding |
 | `gh context apply` | Apply repo's bound context |
 | `gh context shell-hook` | Print shell integration code |
+| `gh context auth-status` | Show authentication status for all contexts |
 
 ### Creating Contexts
 
@@ -174,24 +174,84 @@ SSH_HOST_ALIAS=
 
 ## Troubleshooting
 
-### "No authentication found"
+### Check Authentication Status
+Use the built-in diagnostics to see authentication status for all contexts:
 ```bash
-gh auth login --hostname <hostname> --scopes repo,read:org
+gh context auth-status
 ```
 
-### "Authenticated as wrong user"  
+This shows which contexts are properly authenticated and provides exact commands to fix issues.
+
+### "No authentication found"
 ```bash
-gh auth login --hostname <hostname> --username <expected-user>
+gh auth login --hostname <hostname> --username <username> --scopes repo,read:org
 ```
+
+### "Authenticated as wrong user" / "Failed to switch to user"
+This happens when GitHub CLI has credentials for multiple users on the same host. The extension will try to switch automatically, but if it fails:
+
+```bash
+# Check what users are authenticated
+gh auth status
+
+# Login as the specific user you need
+gh auth login --hostname <hostname> --username <expected-user> --scopes repo,read:org
+
+# Then try the context switch again
+gh context use <context-name>
+```
+
+### Multiple Users on Same Host (github.com)
+GitHub CLI can manage multiple users per hostname. When switching contexts:
+
+1. **First time setup**: Each user must authenticate separately
+   ```bash
+   gh auth login --hostname github.com --username user1 --scopes repo,read:org
+   gh auth login --hostname github.com --username user2 --scopes repo,read:org
+   ```
+
+2. **Context switching**: The extension automatically switches between authenticated users
+   ```bash
+   gh context new --hostname github.com --user user1 --name personal
+   gh context new --hostname github.com --user user2 --name work
+   gh context use work  # Switches to user2
+   gh context use personal  # Switches to user1
+   ```
 
 ### "Token may be expired"
 ```bash
 gh auth refresh --hostname <hostname>
+# Or re-authenticate
+gh auth login --hostname <hostname> --username <username> --scopes repo,read:org
 ```
 
-### List current auth status
+### Repository Access Issues
+If you get "Repository not found" or authentication errors after switching contexts:
+
+1. Verify the context is active: `gh context current`
+2. Check authentication: `gh context auth-status`
+3. Test access: `gh repo view owner/repo --hostname <hostname>`
+4. If needed, refresh credentials: `gh auth refresh --hostname <hostname>`
+
+### Shell Integration Not Working
+If auto-context switching isn't working:
+
+1. Make sure the shell hook is loaded: `gh context shell-hook >> ~/.bashrc && source ~/.bashrc`
+2. Test in a repo with `.ghcontext`: `cd /path/to/repo && pwd`  
+3. Check if `.ghcontext` exists: `cat .ghcontext`
+
+### Clean Start (Reset Everything)
+If you need to start fresh:
 ```bash
-gh auth status
+# Logout from all hosts
+gh auth logout --hostname github.com
+
+# Remove all contexts
+rm -rf ~/.config/gh/contexts/
+
+# Start over with authentication
+gh auth login --hostname github.com --username <your-username>
+gh context new --from-current --name <context-name>
 ```
 
 ## Roadmap

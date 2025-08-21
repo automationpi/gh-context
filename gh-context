@@ -28,7 +28,7 @@ Commands:
   list                    List all contexts with active indicator
   current                 Show active context and repo-bound context
   new                     Create a new context
-  use <name>              Switch to context (calls gh auth switch + setup-git + refresh)
+  use <name>              Switch to context (fast by default, prompts to auth if needed)
   delete <name>           Remove a saved context
   bind <name>             Write .ghcontext in repo root
   unbind                  Remove .ghcontext from repo root
@@ -83,26 +83,18 @@ set_active_name() {
 
 ensure_logged_in() {
   local host="$1" user="$2"
+  
+  # For context creation, we just need to verify some auth exists
   if ! GH_HOST="$host" gh auth token --hostname "$host" >/dev/null 2>&1; then
     err "No authentication found for '$host'"
-    info "To fix this, run: gh auth login --hostname $host --scopes repo,read:org"
+    info "Please authenticate first: gh auth login --hostname $host --scopes repo,read:org"
     exit 1
   fi
   
-  # Verify the token is for the expected user
-  local current_user
-  if current_user="$(GH_HOST="$host" gh api user --hostname "$host" --jq .login 2>/dev/null)"; then
-    # Handle case where jq output might include quotes or other formatting
-    current_user="${current_user//\"/}"  # Remove quotes
-    current_user="${current_user// /}"   # Remove spaces
-    if [[ "$current_user" != "$user" ]]; then
-      err "Authenticated as '$current_user' on '$host', but context expects '$user'"
-      info "To fix this, run: gh auth login --hostname $host --username $user --scopes repo,read:org"
-      exit 1
-    fi
-  else
-    err "Unable to verify authentication for '$user' on '$host'"
-    info "Your token may be expired. Run: gh auth refresh --hostname $host"
+  # We don't switch users during context creation, just verify connectivity
+  if ! timeout 3 bash -c "GH_HOST=\"$host\" gh api user --hostname \"$host\"" >/dev/null 2>&1; then
+    err "Unable to connect to '$host'"
+    info "Check your network connection or try: gh auth refresh --hostname $host"
     exit 1
   fi
 }
@@ -225,27 +217,47 @@ cmd_use() {
   }
   
   read_kv "$file"
-  ensure_logged_in "$HOSTNAME" "$USER"
-
-  info "Switching to $USER@$HOSTNAME..."
   
-  # Switch authentication
-  if ! GH_HOST="$HOSTNAME" gh auth switch --hostname "$HOSTNAME" --user "$USER" 2>/dev/null; then
-    err "Failed to switch authentication"
-    info "Try: gh auth login --hostname $HOSTNAME --username $USER"
-    exit 1
-  fi
-
-  # Setup Git integration
-  if ! GH_HOST="$HOSTNAME" gh auth setup-git --hostname "$HOSTNAME" 2>/dev/null; then
-    info "Warning: Failed to setup Git integration (continuing anyway)"
-  fi
-
-  # Refresh token (best effort)
-  GH_HOST="$HOSTNAME" gh auth refresh --hostname "$HOSTNAME" >/dev/null 2>&1 || true
-
+  # Set context immediately (fast by default)
   set_active_name "$name"
-  ok "Now using context '$name'"
+  ok "Switched to context '$name' ($USER@$HOSTNAME)"
+  
+  # Test if authentication works
+  info "• Testing authentication..."
+  if test_auth "$HOSTNAME" "$USER"; then
+    ok "Authentication verified"
+    return 0
+  fi
+  
+  # Authentication failed - prompt user to fix it
+  err "Authentication required for $USER@$HOSTNAME"
+  info ""
+  info "Your context has been set, but authentication is needed."
+  info "Please authenticate and your context will work automatically:"
+  info ""
+  info "  gh auth login --hostname $HOSTNAME --username $USER --scopes repo,read:org"
+  info ""
+  info "After authentication, all gh commands will use the correct account."
+}
+
+# Test authentication without switching 
+test_auth() {
+  local host="$1" user="$2"
+  
+  # Quick token check
+  if ! GH_HOST="$host" gh auth token --hostname "$host" >/dev/null 2>&1; then
+    return 1
+  fi
+  
+  # Check if it's the right user (with timeout)
+  local current_user
+  if current_user="$(timeout 3 bash -c "GH_HOST=\"$host\" gh api user --hostname \"$host\" --jq .login 2>/dev/null")"; then
+    current_user="${current_user//\"/}"
+    current_user="${current_user// /}"
+    [[ "$current_user" == "$user" ]]
+  else
+    return 1
+  fi
 }
 
 cmd_delete() {
@@ -342,6 +354,63 @@ fi
 EOS
 }
 
+cmd_auth_status() {
+  printf "Authentication status for all contexts:\n\n"
+  
+  if ! ls "$CTX_DIR"/*.ctx >/dev/null 2>&1; then
+    info "No contexts found"
+    return 0
+  fi
+  
+  local current_active
+  current_active="$(get_active_name)"
+  
+  for f in "$CTX_DIR"/*.ctx; do
+    local name
+    name="$(basename "$f" .ctx)"
+    read_kv "$f"
+    
+    local status_icon=""
+    [[ "$name" == "$current_active" ]] && status_icon=" *"
+    
+    printf "Context: %s%s\n" "$name" "$status_icon"
+    printf "  Host: %s\n" "$HOSTNAME"
+    printf "  User: %s\n" "$USER"
+    printf "  Transport: %s\n" "$TRANSPORT"
+    
+    # Check authentication status
+    local auth_status="❌"
+    local current_user=""
+    
+    if GH_HOST="$HOSTNAME" gh auth token --hostname "$HOSTNAME" >/dev/null 2>&1; then
+      if current_user="$(GH_HOST="$HOSTNAME" gh api user --hostname "$HOSTNAME" --jq .login 2>/dev/null)"; then
+        current_user="${current_user//\"/}"
+        current_user="${current_user// /}"
+        if [[ "$current_user" == "$USER" ]]; then
+          auth_status="✅"
+        else
+          auth_status="⚠️  (authenticated as $current_user)"
+        fi
+      else
+        auth_status="⚠️  (token may be expired)"
+      fi
+    fi
+    
+    printf "  Auth: %s\n" "$auth_status"
+    
+    # Show login command if not authenticated correctly
+    if [[ "$auth_status" == "❌" ]]; then
+      printf "  To fix: gh auth login --hostname %s --username %s --scopes repo,read:org\n" "$HOSTNAME" "$USER"
+    elif [[ "$auth_status" == ⚠️* ]]; then
+      printf "  To fix: gh auth login --hostname %s --username %s --scopes repo,read:org\n" "$HOSTNAME" "$USER"
+    fi
+    
+    printf "\n"
+  done
+  
+  [[ -n "$current_active" ]] && printf "* = active context\n"
+}
+
 # Main dispatch
 if ! have_cmd gh; then
   err "GitHub CLI (gh) not found"
@@ -360,6 +429,7 @@ case "$sub" in
   unbind) shift; cmd_unbind "$@";;
   apply) shift; cmd_apply "$@";;
   shell-hook) shift; cmd_shell_hook "$@";;
+  auth-status) shift; cmd_auth_status "$@";;
   -h|--help|help|"") usage;;
   *) err "Unknown command: $sub"; echo; usage; exit 1;;
 esac
